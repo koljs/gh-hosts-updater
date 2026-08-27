@@ -8,6 +8,7 @@ GitHub Hosts Updater - Windows 应用
 
 import os
 import re
+import ssl
 import sys
 import time
 import socket
@@ -45,9 +46,15 @@ LOG_DIR = os.path.join(os.path.expanduser("~"), ".gh_hosts_logs")
 REQUEST_TIMEOUT = 15  # 秒
 SPEED_TEST_PORT = 443
 SPEED_TEST_TIMEOUT = 3.0  # 单次 TCP 连接超时（秒）
-SPEED_TEST_ATTEMPTS = 2  # 每个 IP 测速次数，取平均
+SPEED_TEST_ATTEMPTS = 4  # 每个 IP 连续测速次数，须全部成功才算稳定
+SPEED_TEST_INTERVAL = 1.0  # 相邻两次测速的间隔（秒），用于识别间歇性抖动的 IP
 SPEED_TEST_WORKERS = 16  # 测速并发线程数
 IPV4_PATTERN = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+TLS_VERIFY_ROUNDS = 3  # 每个域名最多尝试的候选 IP 轮数（TLS 握手验证）
+# 复用的 TLS 验证上下文（只验证握手可达性，不校验证书）
+_TLS_CTX = ssl.create_default_context()
+_TLS_CTX.check_hostname = False
+_TLS_CTX.verify_mode = ssl.CERT_NONE
 # 获取系统默认编码
 SYSTEM_ENCODING = locale.getpreferredencoding(False) or "gbk"
 # ==============================
@@ -146,11 +153,17 @@ def parse_hosts_entries(contents, logger):
 
 
 def speed_test_ips(ips, logger):
-    """并发对候选 IP 做 TCP 连接测速，返回 {ip: 平均延迟ms}（不可达的 IP 不在结果中）"""
+    """并发对候选 IP 做稳定性测速，返回 {ip: 平均延迟ms}
+
+    每个 IP 连续测 SPEED_TEST_ATTEMPTS 次（间隔 SPEED_TEST_INTERVAL 秒），
+    任一次失败即视为不稳定并淘汰，用于过滤间歇性抖动的 IP。
+    """
 
     def test_one(ip):
         latencies = []
-        for _ in range(SPEED_TEST_ATTEMPTS):
+        for i in range(SPEED_TEST_ATTEMPTS):
+            if i > 0:
+                time.sleep(SPEED_TEST_INTERVAL)
             t0 = time.perf_counter()
             try:
                 with socket.create_connection(
@@ -158,25 +171,46 @@ def speed_test_ips(ips, logger):
                 ):
                     latencies.append((time.perf_counter() - t0) * 1000)
             except Exception:
-                return None
+                return None  # 任何一次失败都视为不稳定
         return sum(latencies) / len(latencies)
 
-    logger(f"开始 IP 优选测速: {len(ips)} 个候选 IP, "
-           f"端口 {SPEED_TEST_PORT}, 每个测 {SPEED_TEST_ATTEMPTS} 次取平均...")
+    logger(f"开始稳定性测速: {len(ips)} 个候选 IP, 端口 {SPEED_TEST_PORT}, "
+           f"每个连续测 {SPEED_TEST_ATTEMPTS} 次（间隔 {SPEED_TEST_INTERVAL:.0f}s）"
+           f"须全部成功才可用...")
     results = {}
     with ThreadPoolExecutor(max_workers=SPEED_TEST_WORKERS) as pool:
         for ip, ms in zip(ips, pool.map(test_one, ips)):
             if ms is not None:
                 results[ip] = ms
-    logger(f"测速完成: {len(results)}/{len(ips)} 个 IP 可用")
+    logger(f"测速完成: {len(results)}/{len(ips)} 个 IP 稳定可用")
     return results
 
 
-def select_best_ips(candidates, speed_enabled, logger):
-    """为每个域名选出最优 IP，返回 [(ip, domain), ...]
+def tls_verify(ip, domain):
+    """对 ip:443 做带 SNI 的 TLS 握手验证
 
-    测速启用时选延迟最低的候选 IP；某域名所有候选均不可达时，
-    回退到最高优先级源给出的 IP。
+    有些 IP 会出现「TCP 能连上但 TLS 握手被丢弃」的间歇性阻断，
+    仅靠 TCP 连接测速发现不了，必须做真实的 TLS 握手。
+    """
+    try:
+        with socket.create_connection(
+            (ip, SPEED_TEST_PORT), timeout=SPEED_TEST_TIMEOUT
+        ) as sock:
+            with _TLS_CTX.wrap_socket(sock, server_hostname=domain):
+                return True
+    except Exception:
+        return False
+
+
+def select_best_ips(candidates, speed_enabled, logger):
+    """为每个域名选出最优 IP，返回 ([(ip, domain), ...], {ip: 延迟ms})
+
+    优选分两步：
+    1. 稳定性测速（speed_enabled 时）：每个唯一 IP 连续 TCP 测多次，
+       全部成功才可用，按平均延迟为每个域名的候选排序。
+    2. TLS 握手验证：对每个域名的候选按顺序做带 SNI 的 TLS 握手，
+       失败自动换次优候选再验，最多 TLS_VERIFY_ROUNDS 轮；
+       候选耗尽仍失败时回退到默认候选。
     """
     # 汇总所有唯一 IP（不同域名常共用同一批 IP，只测一次）
     all_ips = []
@@ -189,20 +223,52 @@ def select_best_ips(candidates, speed_enabled, logger):
     if not speed_enabled:
         logger("IP 优选测速已禁用，直接使用最高优先级源的数据")
 
+    # 每个域名的候选按测速延迟排序（未测速的按源顺序殿后）
+    ordered = {
+        domain: sorted(
+            (ip for ip in ips if ip in latency), key=latency.get
+        ) + [ip for ip in ips if ip not in latency]
+        for domain, ips in candidates.items()
+    }
+
+    choice = {}
+    if speed_enabled:
+        pending = list(ordered.keys())
+        for round_no in range(1, TLS_VERIFY_ROUNDS + 1):
+            if not pending:
+                break
+            pairs, no_candidate = [], []
+            for d in pending:
+                if round_no <= len(ordered[d]):
+                    pairs.append((d, ordered[d][round_no - 1]))
+                else:
+                    no_candidate.append(d)
+            if pairs:
+                logger(f"TLS 握手验证第 {round_no} 轮: {len(pairs)} 个域名...")
+                with ThreadPoolExecutor(max_workers=SPEED_TEST_WORKERS) as pool:
+                    oks = list(pool.map(lambda p: tls_verify(p[1], p[0]), pairs))
+                failed = []
+                for (d, ip), ok in zip(pairs, oks):
+                    if ok:
+                        choice[d] = ip
+                    else:
+                        logger(f"  {d}: 候选 {ip} TLS 握手失败，更换次优候选")
+                        failed.append(d)
+                pending = failed + no_candidate
+            else:
+                pending = no_candidate
+
     entries = []
-    for domain, ips in candidates.items():
-        best = None
-        if latency:
-            available = [(latency[ip], ip) for ip in ips if ip in latency]
-            if available:
-                best = min(available)[1]
-        if best is None:
-            best = ips[0]  # 回退：最高优先级源的 IP
-            logger(f"  {domain} -> {best}（回退默认）")
+    for domain, ips in ordered.items():
+        best = choice.get(domain) or ips[0]
+        if domain in choice:
+            ms = latency.get(best)
+            ms_text = f"{ms:.0f}ms，TLS 验证通过" if ms is not None else "TLS 验证通过"
+            logger(f"  {domain} -> {best}（{ms_text}）")
         else:
-            logger(f"  {domain} -> {best}（{latency[best]:.0f}ms）")
+            logger(f"  {domain} -> {best}（回退默认）")
         entries.append((best, domain))
-    return entries
+    return entries, latency
 
 
 def build_section(entries):
@@ -212,6 +278,72 @@ def build_section(entries):
         lines.append(f"{ip} {domain}")
     lines.append(SECTION_END)
     return "\n".join(lines)
+
+
+def check_github_https():
+    """对 https://github.com 发起真实 HTTPS 请求验证连通性（绕过系统代理）"""
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(
+            "https://github.com",
+            method="HEAD",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with opener.open(req, timeout=10) as resp:
+            return 200 <= resp.status < 400
+    except Exception:
+        return False
+
+
+def replace_hosts_line(domain, new_ip):
+    """替换 hosts 文件中指定域名的 IP（仅替换第一条精确匹配）"""
+    with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+    pattern = re.compile(r"^\S+[ \t]+" + re.escape(domain) + r"[ \t]*$", re.MULTILINE)
+    new_content, count = pattern.subn(f"{new_ip} {domain}", content, count=1)
+    if count == 0:
+        return False
+    with open(HOSTS_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(new_content)
+    return True
+
+
+def post_write_verify(candidates, latency, logger, max_tries=5):
+    """写入 hosts 后对 github.com 发真实 HTTPS 请求验证
+
+    验证失败说明选出的 IP 实际不可用（如间歇性阻断），
+    此时按测速延迟顺序依次换用其他候选 IP 重写并重新验证。
+    返回 True 表示最终验证通过。
+    """
+    logger("---------- 写后验证 ----------")
+    if check_github_https():
+        logger("✓ github.com 实际访问验证通过")
+        return True
+
+    domain = "github.com"
+    ips = candidates.get(domain, [])
+    if not ips:
+        logger("✗ github.com 访问失败，且无候选 IP 可更换")
+        return False
+
+    # 候选按测速延迟排序（未参与测速的按源顺序殿后）
+    ordered = sorted(
+        (ip for ip in ips if ip in latency), key=lambda ip: latency[ip]
+    ) + [ip for ip in ips if ip not in latency]
+
+    logger(f"✗ github.com 访问失败，开始更换候选 IP 重试（最多 {max_tries} 个）...")
+    for ip in ordered[:max_tries + 1]:
+        if not replace_hosts_line(domain, ip):
+            logger(f"  错误: hosts 中未找到 {domain} 条目，无法更换")
+            return False
+        logger(f"  已将 {domain} 更换为 {ip}，刷新 DNS 后重新验证...")
+        flush_dns(logger)
+        if check_github_https():
+            logger(f"✓ 验证通过: {domain} -> {ip}")
+            return True
+        logger(f"  {ip} 仍无法访问，尝试下一个候选 IP...")
+    logger("✗ 所有候选 IP 均无法访问 github.com，网络可能存在整体阻断，请稍后重试")
+    return False
 
 
 def backup_hosts(logger):
@@ -488,7 +620,7 @@ class App:
 
             # 3. IP 优选测速
             self.logger("---------- IP 优选 ----------")
-            entries = select_best_ips(candidates, speed_enabled, self.logger)
+            entries, latency = select_best_ips(candidates, speed_enabled, self.logger)
 
             # 4. 备份原 hosts
             original = backup_hosts(self.logger)
@@ -514,6 +646,9 @@ class App:
             # 7. 刷新 DNS
             self.logger("---------- 刷新 DNS 缓存 ----------")
             flush_dns(self.logger)
+
+            # 8. 写后验证（真实访问 github.com，失败自动更换候选 IP）
+            post_write_verify(candidates, latency, self.logger)
 
             self.logger("========== 更新完成 ==========")
             self.set_status("更新完成 ✓")
@@ -599,7 +734,7 @@ def run_silent():
 
     # IP 优选
     log("---------- IP 优选 ----------")
-    entries = select_best_ips(candidates, speed_enabled, log)
+    entries, latency = select_best_ips(candidates, speed_enabled, log)
 
     # 备份
     original = backup_hosts(log)
@@ -622,6 +757,9 @@ def run_silent():
     # 刷新 DNS
     log("---------- 刷新 DNS 缓存 ----------")
     flush_dns(log)
+
+    # 写后验证（真实访问 github.com，失败自动更换候选 IP）
+    post_write_verify(candidates, latency, log)
 
     log("========== 更新完成 ==========")
     sys.exit(0)
