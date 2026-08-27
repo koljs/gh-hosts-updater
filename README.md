@@ -37,7 +37,7 @@ python main.py
 
 ## 设置自动更新（可选）
 
-打包完成后，右键以管理员身份运行 `install_autoupdate.bat`，会在 Windows 任务计划程序中注册一个每 6 小时执行一次的静默更新任务。
+打包完成后，右键以管理员身份运行 `install_autoupdate.bat`，会在 Windows 任务计划程序中注册一个每 6 小时执行一次的静默更新任务（已注册的任务可用 `schtasks /change /tn "GitHub Hosts Auto Updater" /ri 60` 改为每小时，更及时应对间歇性阻断）。
 
 - 查看任务：任务计划程序 → 任务计划程序库 → `GitHub Hosts Auto Updater`
 - 手动删除任务：
